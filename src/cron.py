@@ -9,6 +9,8 @@ from classes.Twitter import Twitter
 from classes.YouTube import YouTube
 from llm_provider import select_model
 from post_bridge_integration import maybe_crosspost_youtube_short
+from utils import rem_temp_files
+import re
 
 def main():
     """Main function to post content to Twitter or upload videos to YouTube.
@@ -79,18 +81,40 @@ def main():
                     acc["niche"],
                     acc["language"]
                 )
-                youtube.generate_video(tts)
-                upload_success = youtube.upload_video()
-                if upload_success:
-                    if verbose:
-                        success("Uploaded Short.")
-                    maybe_crosspost_youtube_short(
-                        video_path=youtube.video_path,
-                        title=youtube.metadata.get("title", ""),
-                        interactive=False,
+                try:
+                    def _normalize_key(text: str) -> str:
+                        text = (text or "").strip().lower()
+                        text = re.sub(r"\s+", " ", text)
+                        text = re.sub(r"[^a-z0-9 ]+", "", text)
+                        return text
+
+                    existing_titles = set()
+                    existing_topics = set()
+                    try:
+                        for v in youtube.get_videos():
+                            existing_titles.add(_normalize_key(v.get("title", "")))
+                    except Exception:
+                        pass
+
+                    youtube.generate_video_deduped(
+                        tts,
+                        dedupe_titles=existing_titles,
+                        dedupe_topics=existing_topics,
+                        similarity_threshold=0.88,
                     )
-                else:
-                    warning("YouTube upload failed. Skipping Post Bridge cross-post.")
+                    upload_success = youtube.upload_video()
+                    if upload_success:
+                        if verbose:
+                            success("Uploaded Short.")
+                        maybe_crosspost_youtube_short(
+                            video_path=youtube.video_path,
+                            title=youtube.metadata.get("title", ""),
+                            interactive=False,
+                        )
+                    else:
+                        warning("YouTube upload failed. Skipping Post Bridge cross-post.")
+                finally:
+                    rem_temp_files()
                 break
     else:
         error("Invalid Purpose, exiting...")

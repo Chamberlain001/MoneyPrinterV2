@@ -3,8 +3,12 @@ import base64
 import json
 import time
 import os
+import traceback
 import requests
 import assemblyai as aai
+import string
+import random
+import difflib
 
 from utils import *
 from cache import *
@@ -22,8 +26,13 @@ from selenium import webdriver
 from moviepy.video.fx.all import crop
 from moviepy.config import change_settings
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.firefox.service import Service
 from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
 from moviepy.video.tools.subtitles import SubtitlesClip
 from webdriver_manager.firefox import GeckoDriverManager
 from datetime import datetime
@@ -88,8 +97,11 @@ class YouTube:
                 f"Firefox profile path does not exist or is not a directory: {self._fp_profile_path}"
             )
 
-        self.options.add_argument("-profile")
-        self.options.add_argument(self._fp_profile_path)
+        profile = FirefoxProfile(self._fp_profile_path)
+        profile.set_preference("dom.webdriver.enabled", False)
+        profile.set_preference("useAutomationExtension", False)
+        profile.set_preference("privacy.trackingprotection.enabled", False)
+        self.options.profile = profile
 
         # Set the service
         self.service: Service = Service(GeckoDriverManager().install())
@@ -228,7 +240,7 @@ class YouTube:
         Returns:
             image_prompts (List[str]): Generated List of image prompts.
         """
-        n_prompts = len(self.script) / 3
+        n_prompts = min(len(self.script) / 3, 6)
 
         prompt = f"""
         Generate {n_prompts} Image Prompts for AI Image Generation,
@@ -336,6 +348,8 @@ class YouTube:
         base_url = get_nanobanana2_api_base_url().rstrip("/")
         model = get_nanobanana2_model()
         aspect_ratio = get_nanobanana2_aspect_ratio()
+        timeout_sec = get_nanobanana2_timeout_sec()
+        min_delay_sec = get_nanobanana2_min_delay_sec()
 
         endpoint = f"{base_url}/models/{model}:generateContent"
         payload = {
@@ -346,36 +360,107 @@ class YouTube:
             },
         }
 
-        try:
-            response = requests.post(
-                endpoint,
-                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-                json=payload,
-                timeout=300,
-            )
-            response.raise_for_status()
-            body = response.json()
+        max_attempts = 6
+        base_delay_s = 2.0
 
-            candidates = body.get("candidates", [])
-            for candidate in candidates:
-                content = candidate.get("content", {})
-                for part in content.get("parts", []):
-                    inline_data = part.get("inlineData") or part.get("inline_data")
-                    if not inline_data:
-                        continue
-                    data = inline_data.get("data")
-                    mime_type = inline_data.get("mimeType") or inline_data.get("mime_type", "")
-                    if data and str(mime_type).startswith("image/"):
-                        image_bytes = base64.b64decode(data)
-                        return self._persist_image(image_bytes, "Nano Banana 2 API")
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if attempt > 1:
+                    clarified_prompt = (
+                        f"{prompt}\n\n"
+                        "Generate an image only (no text). "
+                        "Vertical 9:16. High quality illustration."
+                    )
+                    payload["contents"] = [{"parts": [{"text": clarified_prompt}]}]
 
-            if get_verbose():
-                warning(f"Nano Banana 2 did not return an image payload. Response: {body}")
-            return None
-        except Exception as e:
-            if get_verbose():
-                warning(f"Failed to generate image with Nano Banana 2 API: {str(e)}")
-            return None
+                response = requests.post(
+                    endpoint,
+                    headers={
+                        "x-goog-api-key": api_key,
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=timeout_sec,
+                )
+
+                if min_delay_sec > 0:
+                    time.sleep(min_delay_sec)
+
+                retryable_statuses = {429, 500, 502, 503, 504}
+                if response.status_code in retryable_statuses:
+                    if attempt >= max_attempts:
+                        response.raise_for_status()
+
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after and retry_after.isdigit():
+                        delay_s = float(retry_after)
+                    else:
+                        delay_s = base_delay_s * (2 ** (attempt - 1))
+                        delay_s += random.random()  # jitter
+
+                    if get_verbose():
+                        warning(
+                            f"Nano Banana 2 API returned {response.status_code}. Retrying in {delay_s:.1f}s... ({attempt}/{max_attempts})"
+                        )
+                    time.sleep(delay_s)
+                    continue
+
+                response.raise_for_status()
+                body = response.json()
+
+                candidates = body.get("candidates", [])
+                for candidate in candidates:
+                    content = candidate.get("content", {})
+                    for part in content.get("parts", []):
+                        inline_data = part.get("inlineData") or part.get("inline_data")
+                        if not inline_data:
+                            continue
+                        data = inline_data.get("data")
+                        mime_type = inline_data.get("mimeType") or inline_data.get(
+                            "mime_type", ""
+                        )
+                        if data and str(mime_type).startswith("image/"):
+                            image_bytes = base64.b64decode(data)
+                            return self._persist_image(image_bytes, "Nano Banana 2 API")
+
+                finish_reasons = [c.get("finishReason") for c in candidates]
+                if "NO_IMAGE" in finish_reasons and attempt < max_attempts:
+                    delay_s = base_delay_s * (2 ** (attempt - 1))
+                    delay_s += random.random()
+                    if get_verbose():
+                        warning(
+                            f"Nano Banana 2 returned NO_IMAGE. Retrying in {delay_s:.1f}s... ({attempt}/{max_attempts})"
+                        )
+                    time.sleep(delay_s)
+                    continue
+
+                if get_verbose():
+                    warning(
+                        f"Nano Banana 2 did not return an image payload. Response: {body}"
+                    )
+                return None
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                if attempt >= max_attempts:
+                    if get_verbose():
+                        warning(
+                            f"Failed to generate image with Nano Banana 2 API after {max_attempts} attempts: {e}"
+                        )
+                    return None
+
+                delay_s = base_delay_s * (2 ** (attempt - 1))
+                delay_s += random.random()
+                if get_verbose():
+                    warning(
+                        f"Nano Banana 2 network error ({e}). Retrying in {delay_s:.1f}s... ({attempt}/{max_attempts})"
+                    )
+                time.sleep(delay_s)
+                continue
+            except Exception as e:
+                if get_verbose():
+                    warning(f"Failed to generate image with Nano Banana 2 API: {str(e)}")
+                return None
+
+        return None
 
     def generate_image(self, prompt: str) -> str:
         """
@@ -560,6 +645,22 @@ class YouTube:
         threads = get_threads()
         tts_clip = AudioFileClip(self.tts_path)
         max_duration = tts_clip.duration
+
+        if len(self.images) == 0:
+            raise RuntimeError(
+                "No images were generated, so the video cannot be composed. "
+                "Check your image provider configuration and re-run."
+            )
+
+        existing_images = [p for p in self.images if os.path.isfile(p)]
+        if len(existing_images) == 0:
+            raise RuntimeError(
+                "All generated images are missing on disk (they may have been cleaned up). "
+                "Try running again without deleting .mp files between steps."
+            )
+
+        self.images = existing_images
+
         req_dur = max_duration / len(self.images)
 
         # Make a generator that returns a TextClip when called with consecutive
@@ -617,7 +718,11 @@ class YouTube:
 
         final_clip = concatenate_videoclips(clips)
         final_clip = final_clip.set_fps(30)
-        random_song = choose_random_song()
+        random_song = None
+        try:
+            random_song = choose_random_song()
+        except Exception as e:
+            warning(f"Failed to choose background song, continuing without it: {e}")
 
         subtitles = None
         try:
@@ -628,11 +733,16 @@ class YouTube:
         except Exception as e:
             warning(f"Failed to generate subtitles, continuing without subtitles: {e}")
 
-        random_song_clip = AudioFileClip(random_song).set_fps(44100)
+        if random_song:
+            random_song_clip = AudioFileClip(random_song).set_fps(44100)
 
-        # Turn down volume
-        random_song_clip = random_song_clip.fx(afx.volumex, 0.1)
-        comp_audio = CompositeAudioClip([tts_clip.set_fps(44100), random_song_clip])
+            # Turn down volume
+            random_song_clip = random_song_clip.fx(afx.volumex, 0.1)
+            comp_audio = CompositeAudioClip(
+                [tts_clip.set_fps(44100), random_song_clip]
+            )
+        else:
+            comp_audio = tts_clip.set_fps(44100)
 
         final_clip = final_clip.set_audio(comp_audio)
         final_clip = final_clip.set_duration(tts_clip.duration)
@@ -656,24 +766,98 @@ class YouTube:
         Returns:
             path (str): The path to the generated MP4 File.
         """
-        # Generate the Topic
-        self.generate_topic()
+        return self.generate_video_deduped(tts_instance)
 
-        # Generate the Script
-        self.generate_script()
+    def _normalize_dedupe_key(self, text: str) -> str:
+        key = (text or "").strip().lower()
+        key = re.sub(r"\s+", " ", key)
+        key = key.translate(str.maketrans("", "", string.punctuation))
+        return key
 
-        # Generate the Metadata
-        self.generate_metadata()
+    def _is_similar_to_any(
+        self, key: str, candidates: set[str] | None, threshold: float
+    ) -> bool:
+        if not key or not candidates:
+            return False
+
+        for existing in candidates:
+            if not existing:
+                continue
+            if key == existing:
+                return True
+            if difflib.SequenceMatcher(None, key, existing).ratio() >= threshold:
+                return True
+        return False
+
+    def generate_video_deduped(
+        self,
+        tts_instance: TTS,
+        dedupe_titles: set[str] | None = None,
+        dedupe_topics: set[str] | None = None,
+        max_uniqueness_attempts: int = 6,
+        similarity_threshold: float = 0.88,
+    ) -> str:
+        self.images = []
+
+        last_dup_reason = None
+        for attempt in range(max_uniqueness_attempts):
+            # Generate the Topic
+            self.generate_topic()
+
+            # Generate the Script
+            self.generate_script()
+
+            # Generate the Metadata
+            self.generate_metadata()
+
+            title_key = self._normalize_dedupe_key(self.metadata.get("title", ""))
+            topic_key = self._normalize_dedupe_key(getattr(self, "topic", ""))
+
+            title_dup = self._is_similar_to_any(
+                title_key, dedupe_titles, similarity_threshold
+            )
+            topic_dup = self._is_similar_to_any(
+                topic_key, dedupe_topics, similarity_threshold
+            )
+
+            if title_dup or topic_dup:
+                last_dup_reason = (
+                    f"duplicate title" if title_dup else "duplicate topic"
+                )
+                if get_verbose():
+                    warning(
+                        f"Generated non-unique content ({last_dup_reason}), retrying... ({attempt+1}/{max_uniqueness_attempts})"
+                    )
+                continue
+
+            if dedupe_titles is not None and title_key:
+                dedupe_titles.add(title_key)
+            if dedupe_topics is not None and topic_key:
+                dedupe_topics.add(topic_key)
+            break
+        else:
+            raise RuntimeError(
+                f"Failed to generate unique content after {max_uniqueness_attempts} attempts"
+                + (f" (last reason: {last_dup_reason})" if last_dup_reason else "")
+            )
 
         # Generate the Image Prompts
         self.generate_prompts()
 
         # Generate the Images
         for prompt in self.image_prompts:
-            self.generate_image(prompt)
+            image_path = self.generate_image(prompt)
+            if image_path is None:
+                continue
 
         # Generate the TTS
         self.generate_script_to_speech(tts_instance)
+
+        if len(self.images) == 0:
+            raise RuntimeError(
+                "Image generation produced 0 images. "
+                "Verify nanobanana2_api_key (or GEMINI_API_KEY) is valid, and ensure the configured model supports image output."
+            )
 
         # Combine everything
         path = self.combine()
@@ -700,6 +884,24 @@ class YouTube:
 
         return channel_id
 
+    def _restart_browser(self) -> None:
+        """
+        Restarts the Firefox browser session.
+        """
+        try:
+            self.browser.quit()
+        except Exception:
+            pass
+
+        profile = FirefoxProfile(self._fp_profile_path)
+        profile.set_preference("dom.webdriver.enabled", False)
+        profile.set_preference("useAutomationExtension", False)
+        profile.set_preference("privacy.trackingprotection.enabled", False)
+        self.options.profile = profile
+
+        self.service = Service(GeckoDriverManager().install())
+        self.browser = webdriver.Firefox(service=self.service, options=self.options)
+
     def upload_video(self) -> bool:
         """
         Uploads the video to YouTube.
@@ -708,6 +910,7 @@ class YouTube:
             success (bool): Whether the upload was successful or not.
         """
         try:
+            self._restart_browser()
             self.get_channel_id()
 
             driver = self.browser
@@ -716,9 +919,42 @@ class YouTube:
             # Go to youtube.com/upload
             driver.get("https://www.youtube.com/upload")
 
+            if "accounts.google.com" in driver.current_url:
+                warning(
+                    "YouTube redirected to Google Sign-In. Please complete login in the opened Firefox window."
+                )
+                try:
+                    WebDriverWait(driver, 180).until(
+                        lambda d: "accounts.google.com" not in d.current_url
+                    )
+                except TimeoutException:
+                    try:
+                        title = driver.title or ""
+                    except Exception:
+                        title = ""
+
+                    blocked = "couldn't sign you in" in title.lower()
+                    if blocked:
+                        raise RuntimeError(
+                            "Google blocked sign-in in the automated browser session ('Couldn't sign you in / browser may not be secure'). "
+                            "This script does not support typing email/password from config. "
+                            "Fix: open Firefox normally with the SAME profile folder, log into YouTube/Studio manually, confirm you can open https://www.youtube.com/upload, then re-run automation using that profile."
+                        )
+                    raise RuntimeError(
+                        "Timed out waiting for Google sign-in to complete. Please finish login in the opened Firefox window, then try again."
+                    )
+
+                driver.get("https://www.youtube.com/upload")
+                if "accounts.google.com" in driver.current_url:
+                    raise RuntimeError(
+                        "Still on Google sign-in after attempting to continue. Ensure this Firefox profile is logged into YouTube before running automation."
+                    )
+
             # Set video file
             FILE_PICKER_TAG = "ytcp-uploads-file-picker"
-            file_picker = driver.find_element(By.TAG_NAME, FILE_PICKER_TAG)
+            file_picker = WebDriverWait(driver, 30).until(
+                EC.presence_of_element_located((By.TAG_NAME, FILE_PICKER_TAG))
+            )
             INPUT_TAG = "input"
             file_input = file_picker.find_element(By.TAG_NAME, INPUT_TAG)
             file_input.send_keys(self.video_path)
@@ -737,7 +973,10 @@ class YouTube:
 
             title_el.click()
             time.sleep(1)
-            title_el.clear()
+            # ใช้ keyboard shortcut แทน .clear()
+            title_el.send_keys(Keys.CONTROL + "a")  # หรือ COMMAND บน Mac
+            title_el.send_keys(Keys.COMMAND + "a")
+            title_el.send_keys(Keys.DELETE)
             title_el.send_keys(self.metadata["title"])
 
             if verbose:
@@ -747,7 +986,8 @@ class YouTube:
             time.sleep(10)
             description_el.click()
             time.sleep(0.5)
-            description_el.clear()
+            description_el.send_keys(Keys.COMMAND + "a")
+            description_el.send_keys(Keys.DELETE)
             description_el.send_keys(self.metadata["description"])
 
             time.sleep(0.5)
@@ -848,8 +1088,42 @@ class YouTube:
             driver.quit()
 
             return True
-        except:
-            self.browser.quit()
+        except Exception as e:
+            if get_verbose():
+                warning(f"YouTube upload failed with error: {e}")
+                warning(traceback.format_exc())
+                try:
+                    warning(f"YouTube upload current URL: {self.browser.current_url}")
+                except Exception:
+                    pass
+                try:
+                    artifact_dir = os.path.join(ROOT_DIR, ".mp")
+                    os.makedirs(artifact_dir, exist_ok=True)
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    artifact_id = str(uuid4())
+                    base = f"youtube_upload_error_{ts}_{artifact_id}"
+                    screenshot_path = os.path.join(artifact_dir, f"{base}.png")
+                    html_path = os.path.join(artifact_dir, f"{base}.html")
+                    try:
+                        self.browser.save_screenshot(screenshot_path)
+                        info(
+                            f" => Saved upload error screenshot to '{screenshot_path}'"
+                        )
+                    except Exception as screenshot_err:
+                        warning(f"Failed to save screenshot: {screenshot_err}")
+                    try:
+                        with open(html_path, "w", encoding="utf-8") as f:
+                            f.write(self.browser.page_source)
+                        info(f" => Saved upload error HTML to '{html_path}'")
+                    except Exception as html_err:
+                        warning(f"Failed to save page source: {html_err}")
+                except Exception as artifact_err:
+                    warning(f"Failed to write upload error artifacts: {artifact_err}")
+
+            try:
+                self.browser.quit()
+            except Exception:
+                pass
             return False
 
     def get_videos(self) -> List[dict]:

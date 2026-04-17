@@ -143,9 +143,32 @@ def get_nanobanana2_aspect_ratio() -> str:
     with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
         return json.load(file).get("nanobanana2_aspect_ratio", "9:16")
 
+
+def get_nanobanana2_timeout_sec() -> int:
+    """
+    Gets the request timeout (seconds) for Nano Banana 2 image generation.
+
+    Returns:
+        timeout (int): Timeout seconds
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return int(json.load(file).get("nanobanana2_timeout_sec", 120))
+
+
+def get_nanobanana2_min_delay_sec() -> float:
+    """
+    Gets the minimum delay between Nano Banana 2 requests.
+
+    Returns:
+        delay (float): Delay seconds
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return float(json.load(file).get("nanobanana2_min_delay_sec", 0.5))
+
 def get_threads() -> int:
     """
-    Gets the amount of threads to use for example when writing to a file with MoviePy.
+    Gets the threads from the config file.
+ads to use for example when writing to a file with MoviePy.
 
     Returns:
         threads (int): Amount of threads

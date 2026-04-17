@@ -161,18 +161,47 @@ def main():
                     tts = TTS()
 
                     if user_input == 1:
-                        youtube.generate_video(tts)
-                        upload_to_yt = question("Do you want to upload this video to YouTube? (Yes/No): ")
-                        if upload_to_yt.lower() == "yes":
-                            upload_success = youtube.upload_video()
-                            if upload_success:
-                                maybe_crosspost_youtube_short(
-                                    video_path=youtube.video_path,
-                                    title=youtube.metadata.get("title", ""),
-                                    interactive=True,
+                        num_loops = question("How many videos to generate and upload? (default: 1): ").strip()
+                        num_loops = int(num_loops) if num_loops.isdigit() else 1
+
+                        def _normalize_key(text: str) -> str:
+                            text = (text or "").strip().lower()
+                            text = re.sub(r"\s+", " ", text)
+                            text = re.sub(r"[^a-z0-9 ]+", "", text)
+                            return text
+
+                        existing_titles = set()
+                        try:
+                            for v in youtube.get_videos():
+                                existing_titles.add(_normalize_key(v.get("title", "")))
+                        except Exception:
+                            pass
+
+                        existing_topics = set()
+
+                        for i in range(num_loops):
+                            info(f"\n[{i+1}/{num_loops}] Generating video...")
+                            try:
+                                youtube.generate_video_deduped(
+                                    tts,
+                                    dedupe_titles=existing_titles,
+                                    dedupe_topics=existing_topics,
                                 )
-                            else:
-                                warning("YouTube upload failed. Skipping Post Bridge cross-post.")
+                                upload_success = youtube.upload_video()
+                                if upload_success:
+                                    success(f"[{i+1}/{num_loops}] Upload successful!")
+                                    maybe_crosspost_youtube_short(
+                                        video_path=youtube.video_path,
+                                        title=youtube.metadata.get("title", ""),
+                                        interactive=False,  # ไม่ถามทุกรอบ
+                                    )
+                                else:
+                                    warning(f"[{i+1}/{num_loops}] Upload failed. Continuing...")
+                            except Exception as e:
+                                warning(f"[{i+1}/{num_loops}] Error: {e}. Continuing to next video...")
+                                continue
+                            finally:
+                                rem_temp_files()
                     elif user_input == 2:
                         videos = youtube.get_videos()
 
@@ -213,8 +242,8 @@ def main():
                             success("Set up CRON Job.")
                         elif user_input == 2:
                             # Upload Twice a day
-                            schedule.every().day.at("10:00").do(job)
-                            schedule.every().day.at("16:00").do(job)
+                            schedule.every().day.at("12:00").do(job)
+                            schedule.every().day.at("20:00").do(job)
                             success("Set up CRON Job.")
                         else:
                             break

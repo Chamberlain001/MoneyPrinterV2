@@ -3,6 +3,7 @@ import random
 import zipfile
 import requests
 import platform
+import shutil
 
 from status import *
 from config import *
@@ -45,7 +46,7 @@ def build_url(youtube_video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={youtube_video_id}"
 
 
-def rem_temp_files() -> None:
+def rem_temp_files(keep_upload_error_artifacts: bool = False) -> None:
     """
     Removes temporary files in the `.mp` directory.
 
@@ -55,11 +56,27 @@ def rem_temp_files() -> None:
     # Path to the `.mp` directory
     mp_dir = os.path.join(ROOT_DIR, ".mp")
 
+    if not os.path.isdir(mp_dir):
+        return
+
     files = os.listdir(mp_dir)
 
     for file in files:
-        if not file.endswith(".json"):
-            os.remove(os.path.join(mp_dir, file))
+        if keep_upload_error_artifacts and file.startswith("youtube_upload_error_"):
+            continue
+        if file.endswith(".json"):
+            continue
+
+        target = os.path.join(mp_dir, file)
+        try:
+            if os.path.isdir(target):
+                shutil.rmtree(target, ignore_errors=False)
+            else:
+                os.remove(target)
+        except PermissionError as e:
+            warning(f"Could not remove temp path '{target}': {e}")
+        except OSError as e:
+            warning(f"Could not remove temp path '{target}': {e}")
 
 
 def fetch_songs() -> None:
